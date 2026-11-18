@@ -1,20 +1,25 @@
 """Forecast a launch day's Twitch viewers, hour by hour, from its first hour.
 
 Method (fitted offline by leave-one-out over the comparable launches that
-ship inside every case file):
+ship inside every case file; v2 constants re-tuned on the same LOO, scored
+on the large launches the final resembles):
 
   * Each comparable with a complete release day becomes a log-ratio curve
     r(h) = ln(viewers(h) / viewers(hour 1)), h = 2..24.
   * Comparables are weighted by how much they resemble this case:
-    a Gaussian kernel on the log of the hour-1 print (bandwidth 1.0) and on
+    a Gaussian kernel on the log of the hour-1 print (bandwidth 0.75) and on
     the pre-release ramp (mean log viewers of the six hours before the day
-    starts, relative to hour 1; bandwidth 1.5), times 4 when the comparable's
+    starts, relative to hour 1; bandwidth 2.0), times 8 when the comparable's
     unlock pattern (rolling local midnights vs one simultaneous global
     unlock, read from its unlock note) matches this case's.
-  * The forecast for an hour is the weighted empirical quantiles of the
-    pool's log-ratios at that hour, smoothed across neighbouring hours,
-    with the inner quantiles pulled 15% and the outer quantiles 10% toward
-    the median (the calibration that scored best in cross-validation).
+  * The forecast for an hour blends two views of the pool, 70/30: the
+    weighted empirical quantiles of the pool's log-ratios at that hour
+    (interpolated weighted quantiles), and the quantiles of the residuals
+    around a per-hour weighted linear fit of log-ratio on log hour-1 size,
+    which lets the shape trend extrapolate to launches larger than any in
+    the pool. Both views shrink the inner quantiles 15% and the outer
+    quantiles 10% toward their median; the blend is smoothed across
+    neighbouring hours and pulled 10% toward the persistence shape.
   * With no usable comparable the program falls back to the persistence
     shape: every hour at hour 1's print, spread 0.15 * sqrt(h - 1).
 
@@ -40,11 +45,14 @@ Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
 SIGMA = 0.15
 
 # Cross-validated constants (leave-one-out over the kit's comparables).
-SCALE_BANDWIDTH = 1.0    # kernel width on ln(hour-1 viewers)
-RAMP_BANDWIDTH = 1.5     # kernel width on the pre-release ramp feature
-CLASS_MULTIPLIER = 4.0   # extra weight when the unlock pattern matches
+SCALE_BANDWIDTH = 0.75   # kernel width on ln(hour-1 viewers)
+RAMP_BANDWIDTH = 2.0     # kernel width on the pre-release ramp feature
+CLASS_MULTIPLIER = 8.0   # extra weight when the unlock pattern matches
 INNER_SHRINK = 0.85      # 25%/75% quantiles toward the median
 OUTER_SHRINK = 0.90      # 5%/95% quantiles toward the median
+REG_BLEND = 0.3          # weight of the size-regression view in the blend
+REG_RIDGE = 0.5          # ridge on the regression's weighted Sxx
+BASE_BLEND = 0.1         # pull toward the persistence shape, in log space
 
 
 def parse_ts(text):
@@ -103,14 +111,28 @@ def ramp_feature(by, lv0):
 
 
 def weighted_quantile(pairs, tau):
-    pairs.sort()
+    """Weighted quantile with linear interpolation on the midpoint CDF:
+    each value sits at (cumweight - weight/2) / total, and tau between two
+    midpoints interpolates linearly."""
+    pairs = sorted(pairs)
     total = sum(w for _, w in pairs)
+    pts = []
     acc = 0.0
     for value, w in pairs:
+        pts.append((value, (acc + 0.5 * w) / total))
         acc += w
-        if acc / total >= tau:
-            return value
-    return pairs[-1][0]
+    if tau <= pts[0][1]:
+        return pts[0][0]
+    if tau >= pts[-1][1]:
+        return pts[-1][0]
+    for i in range(1, len(pts)):
+        if pts[i][1] >= tau:
+            v0, p0 = pts[i - 1]
+            v1, p1 = pts[i]
+            if p1 == p0:
+                return v1
+            return v0 + (v1 - v0) * (tau - p0) / (p1 - p0)
+    return pts[-1][0]
 
 
 def pool_curves(case, day_start):
@@ -155,18 +177,41 @@ def forecast_log_quantiles(case):
             w *= CLASS_MULTIPLIER
         weights.append(w)
 
+    def shrunk_row(pairs, center):
+        row = []
+        for qi, tau in enumerate(LEVELS):
+            q = weighted_quantile(list(pairs), tau)
+            if qi in (0, 4):
+                q = center + OUTER_SHRINK * (q - center)
+            elif qi in (1, 3):
+                q = center + INNER_SHRINK * (q - center)
+            row.append(q)
+        return row
+
     raw = []
     for hi in range(23):
         pairs = [(pool[j][0][hi], weights[j]) for j in range(len(pool))]
-        median = weighted_quantile(pairs, 0.5)
-        row = []
-        for qi, tau in enumerate(LEVELS):
-            q = weighted_quantile(pairs, tau)
-            if qi in (0, 4):
-                q = median + OUTER_SHRINK * (q - median)
-            elif qi in (1, 3):
-                q = median + INNER_SHRINK * (q - median)
-            row.append(q)
+        median = weighted_quantile(list(pairs), 0.5)
+        row = shrunk_row(pairs, median)
+        if REG_BLEND:
+            # Second view: weighted linear fit of this hour's log-ratio on
+            # ln(hour-1 viewers); quantiles of its residuals, placed at the
+            # fitted value for this case's size.
+            sw = sum(weights)
+            xm = sum(w * pool[j][1] for j, w in enumerate(weights)) / sw
+            ym = sum(w * pool[j][0][hi] for j, w in enumerate(weights)) / sw
+            sxx = sum(w * (pool[j][1] - xm) ** 2
+                      for j, w in enumerate(weights))
+            sxy = sum(w * (pool[j][1] - xm) * (pool[j][0][hi] - ym)
+                      for j, w in enumerate(weights))
+            slope = sxy / (sxx + REG_RIDGE)
+            med_reg = ym + slope * (lv0 - xm)
+            resid = [(pool[j][0][hi] - (ym + slope * (pool[j][1] - xm)),
+                      weights[j]) for j in range(len(pool))]
+            rrow = shrunk_row(resid, 0.0)
+            rrow = [med_reg + v for v in rrow]
+            row = [(1.0 - REG_BLEND) * a + REG_BLEND * b
+                   for a, b in zip(row, rrow)]
         raw.append(row)
 
     # Smooth each quantile track across neighbouring hours, then re-anchor
@@ -177,6 +222,11 @@ def forecast_log_quantiles(case):
         row = [sum(raw[k][q] for k in range(lo, hi2)) / (hi2 - lo)
                for q in range(5)]
         smoothed.append(row)
+    if BASE_BLEND:
+        for hi in range(23):
+            base = [z * SIGMA * math.sqrt(hi + 1) for z in Z]
+            smoothed[hi] = [(1.0 - BASE_BLEND) * q + BASE_BLEND * b
+                            for q, b in zip(smoothed[hi], base)]
     return smoothed
 
 
